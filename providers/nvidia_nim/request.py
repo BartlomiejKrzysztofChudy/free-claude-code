@@ -1,13 +1,151 @@
 """Request builder for NVIDIA NIM provider."""
 
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
 from loguru import logger
 
 from config.nim import NimSettings
-from providers.common.message_converter import build_base_request_body
-from providers.common.utils import set_if_not_none
+from core.anthropic import (
+    ReasoningReplayMode,
+    build_base_request_body,
+    set_if_not_none,
+)
+from core.anthropic.conversion import OpenAIConversionError
+from providers.exceptions import InvalidRequestError
+
+_SCHEMA_VALUE_KEYS = frozenset(
+    {
+        "additionalProperties",
+        "additionalItems",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "items",
+        "contains",
+        "propertyNames",
+        "if",
+        "then",
+        "else",
+        "not",
+    }
+)
+_SCHEMA_LIST_KEYS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_SCHEMA_MAP_KEYS = frozenset(
+    {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+)
+
+
+def _clone_strip_extra_body(
+    body: dict[str, Any],
+    strip: Callable[[dict[str, Any]], bool],
+) -> dict[str, Any] | None:
+    """Deep-clone ``body`` and remove fields via ``strip`` on ``extra_body`` only.
+
+    Returns ``None`` when there is no ``extra_body`` dict or ``strip`` reports no change.
+    """
+    cloned_body = deepcopy(body)
+    extra_body = cloned_body.get("extra_body")
+    if not isinstance(extra_body, dict):
+        return None
+    if not strip(extra_body):
+        return None
+    if not extra_body:
+        cloned_body.pop("extra_body", None)
+    return cloned_body
+
+
+def _strip_reasoning_budget_fields(extra_body: dict[str, Any]) -> bool:
+    removed = extra_body.pop("reasoning_budget", None) is not None
+    chat_template_kwargs = extra_body.get("chat_template_kwargs")
+    if (
+        isinstance(chat_template_kwargs, dict)
+        and chat_template_kwargs.pop("reasoning_budget", None) is not None
+    ):
+        removed = True
+    return removed
+
+
+def _strip_chat_template_field(extra_body: dict[str, Any]) -> bool:
+    return extra_body.pop("chat_template", None) is not None
+
+
+def _strip_message_reasoning_content(body: dict[str, Any]) -> bool:
+    removed = False
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if (
+            isinstance(message, dict)
+            and message.pop("reasoning_content", None) is not None
+        ):
+            removed = True
+    return removed
+
+
+def _sanitize_nim_schema_node(value: Any) -> tuple[bool, Any]:
+    """Remove boolean JSON Schema subschemas that hosted NIM rejects."""
+    if isinstance(value, bool):
+        return False, None
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _SCHEMA_VALUE_KEYS:
+                keep, sanitized_item = _sanitize_nim_schema_node(item)
+                if keep:
+                    sanitized[key] = sanitized_item
+            elif key in _SCHEMA_LIST_KEYS and isinstance(item, list):
+                sanitized_items: list[Any] = []
+                for schema_item in item:
+                    keep, sanitized_item = _sanitize_nim_schema_node(schema_item)
+                    if keep:
+                        sanitized_items.append(sanitized_item)
+                if sanitized_items:
+                    sanitized[key] = sanitized_items
+            elif key in _SCHEMA_MAP_KEYS and isinstance(item, dict):
+                sanitized_map: dict[str, Any] = {}
+                for map_key, schema_item in item.items():
+                    keep, sanitized_item = _sanitize_nim_schema_node(schema_item)
+                    if keep:
+                        sanitized_map[map_key] = sanitized_item
+                sanitized[key] = sanitized_map
+            else:
+                sanitized[key] = item
+        return True, sanitized
+    if isinstance(value, list):
+        sanitized_items = []
+        for item in value:
+            keep, sanitized_item = _sanitize_nim_schema_node(item)
+            if keep:
+                sanitized_items.append(sanitized_item)
+        return True, sanitized_items
+    return True, value
+
+
+def _sanitize_nim_tool_schemas(body: dict[str, Any]) -> None:
+    """Sanitize only tool parameter schemas, preserving tool calls/history."""
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return
+
+    sanitized_tools: list[Any] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            sanitized_tools.append(tool)
+            continue
+        sanitized_tool = dict(tool)
+        function = tool.get("function")
+        if isinstance(function, dict):
+            sanitized_function = dict(function)
+            parameters = function.get("parameters")
+            if isinstance(parameters, dict):
+                _, sanitized_parameters = _sanitize_nim_schema_node(parameters)
+                sanitized_function["parameters"] = sanitized_parameters
+            sanitized_tool["function"] = sanitized_function
+        sanitized_tools.append(sanitized_tool)
+
+    body["tools"] = sanitized_tools
 
 
 def _set_extra(
@@ -24,42 +162,19 @@ def _set_extra(
 
 def clone_body_without_reasoning_budget(body: dict[str, Any]) -> dict[str, Any] | None:
     """Clone a request body and strip only reasoning_budget fields."""
-    cloned_body = deepcopy(body)
-    extra_body = cloned_body.get("extra_body")
-    if not isinstance(extra_body, dict):
-        return None
-
-    removed = extra_body.pop("reasoning_budget", None) is not None
-
-    chat_template_kwargs = extra_body.get("chat_template_kwargs")
-    if (
-        isinstance(chat_template_kwargs, dict)
-        and chat_template_kwargs.pop("reasoning_budget", None) is not None
-    ):
-        removed = True
-
-    if not extra_body:
-        cloned_body.pop("extra_body", None)
-
-    if not removed:
-        return None
-
-    return cloned_body
+    return _clone_strip_extra_body(body, _strip_reasoning_budget_fields)
 
 
 def clone_body_without_chat_template(body: dict[str, Any]) -> dict[str, Any] | None:
     """Clone a request body and strip only chat_template."""
+    return _clone_strip_extra_body(body, _strip_chat_template_field)
+
+
+def clone_body_without_reasoning_content(body: dict[str, Any]) -> dict[str, Any] | None:
+    """Clone a request body and strip assistant message ``reasoning_content`` fields."""
     cloned_body = deepcopy(body)
-    extra_body = cloned_body.get("extra_body")
-    if not isinstance(extra_body, dict):
+    if not _strip_message_reasoning_content(cloned_body):
         return None
-
-    if extra_body.pop("chat_template", None) is None:
-        return None
-
-    if not extra_body:
-        cloned_body.pop("extra_body", None)
-
     return cloned_body
 
 
@@ -72,10 +187,17 @@ def build_request_body(
         getattr(request_data, "model", "?"),
         len(getattr(request_data, "messages", [])),
     )
-    body = build_base_request_body(
-        request_data,
-        include_thinking=thinking_enabled,
-    )
+    try:
+        body = build_base_request_body(
+            request_data,
+            reasoning_replay=ReasoningReplayMode.REASONING_CONTENT
+            if thinking_enabled
+            else ReasoningReplayMode.DISABLED,
+        )
+    except OpenAIConversionError as exc:
+        raise InvalidRequestError(str(exc)) from exc
+
+    _sanitize_nim_tool_schemas(body)
 
     # NIM-specific max_tokens: cap against nim.max_tokens
     max_tokens = body.get("max_tokens") or getattr(request_data, "max_tokens", None)

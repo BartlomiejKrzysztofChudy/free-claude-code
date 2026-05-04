@@ -1,5 +1,10 @@
-"""Shared base class for OpenAI-compatible providers (NIM, OpenRouter, LM Studio)."""
+"""OpenAI-style chat base for :class:`OpenAIChatTransport` (NIM, etc.).
 
+``AnthropicMessagesTransport``-based providers (OpenRouter, LM Studio, DeepSeek, …) live
+in separate modules; do not list them as subclasses of this class.
+"""
+
+import asyncio
 import json
 import uuid
 from abc import abstractmethod
@@ -10,22 +15,49 @@ import httpx
 from loguru import logger
 from openai import AsyncOpenAI
 
-from providers.base import BaseProvider, ProviderConfig
-from providers.common import (
+from core.anthropic import (
     ContentType,
     HeuristicToolParser,
     SSEBuilder,
     ThinkTagParser,
     append_request_id,
-    get_user_facing_error_message,
-    map_error,
     map_stop_reason,
 )
+from providers.base import BaseProvider, ProviderConfig
+from providers.error_mapping import (
+    map_error,
+    user_visible_message_for_mapped_provider_error,
+)
+from providers.model_listing import extract_openai_model_ids
 from providers.rate_limit import GlobalRateLimiter
 
 
-class OpenAICompatibleProvider(BaseProvider):
-    """Base class for providers using OpenAI-compatible chat completions API."""
+def _iter_heuristic_tool_use_sse(
+    sse: SSEBuilder, tool_use: dict[str, Any]
+) -> Iterator[str]:
+    """Emit SSE for one heuristic tool_use block (closes open text/thinking first)."""
+    if tool_use.get("name") == "Task" and isinstance(tool_use.get("input"), dict):
+        task_input = tool_use["input"]
+        if task_input.get("run_in_background") is not False:
+            task_input["run_in_background"] = False
+    yield from sse.close_content_blocks()
+    block_idx = sse.blocks.allocate_index()
+    yield sse.content_block_start(
+        block_idx,
+        "tool_use",
+        id=tool_use["id"],
+        name=tool_use["name"],
+    )
+    yield sse.content_block_delta(
+        block_idx,
+        "input_json_delta",
+        json.dumps(tool_use["input"]),
+    )
+    yield sse.content_block_stop(block_idx)
+
+
+class OpenAIChatTransport(BaseProvider):
+    """Base for OpenAI-compatible ``/chat/completions`` adapters (NIM, …)."""
 
     def __init__(
         self,
@@ -39,7 +71,8 @@ class OpenAICompatibleProvider(BaseProvider):
         self._provider_name = provider_name
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
-        self._global_rate_limiter = GlobalRateLimiter.get_instance(
+        self._global_rate_limiter = GlobalRateLimiter.get_scoped_instance(
+            provider_name.lower(),
             rate_limit=config.rate_limit,
             rate_window=config.rate_window,
             max_concurrency=config.max_concurrency,
@@ -74,8 +107,15 @@ class OpenAICompatibleProvider(BaseProvider):
         if client is not None:
             await client.aclose()
 
+    async def list_model_ids(self) -> frozenset[str]:
+        """Return model ids from the provider's OpenAI-compatible models endpoint."""
+        payload = await self._client.models.list()
+        return extract_openai_model_ids(payload, provider_name=self._provider_name)
+
     @abstractmethod
-    def _build_request_body(self, request: Any) -> dict:
+    def _build_request_body(
+        self, request: Any, thinking_enabled: bool | None = None
+    ) -> dict:
         """Build request body. Must be implemented by subclasses."""
 
     def _handle_extra_reasoning(
@@ -105,6 +145,22 @@ class OpenAICompatibleProvider(BaseProvider):
             )
             return stream, retry_body
 
+    def _emit_tool_arg_delta(
+        self, sse: SSEBuilder, tc_index: int, args: str
+    ) -> Iterator[str]:
+        """Emit one argument fragment for a started tool block (Task buffer or raw JSON)."""
+        if not args:
+            return
+        state = sse.blocks.tool_states.get(tc_index)
+        if state is None:
+            return
+        if state.name == "Task":
+            parsed = sse.blocks.buffer_task_args(tc_index, args)
+            if parsed is not None:
+                yield sse.emit_tool_delta(tc_index, json.dumps(parsed))
+            return
+        yield sse.emit_tool_delta(tc_index, args)
+
     def _process_tool_call(self, tc: dict, sse: SSEBuilder) -> Iterator[str]:
         """Process a single tool call delta and yield SSE events."""
         tc_index = tc.get("index", 0)
@@ -113,33 +169,42 @@ class OpenAICompatibleProvider(BaseProvider):
 
         fn_delta = tc.get("function", {})
         incoming_name = fn_delta.get("name")
+        arguments = fn_delta.get("arguments", "") or ""
+
+        if tc.get("id") is not None:
+            sse.blocks.set_stream_tool_id(tc_index, tc.get("id"))
+
         if incoming_name is not None:
             sse.blocks.register_tool_name(tc_index, incoming_name)
 
         state = sse.blocks.tool_states.get(tc_index)
+        resolved_id = (state.tool_id if state and state.tool_id else None) or tc.get(
+            "id"
+        )
+        resolved_name = (state.name if state else "") or ""
+
+        if not state or not state.started:
+            name_ok = bool((resolved_name or "").strip())
+            if name_ok:
+                tool_id = str(resolved_id) if resolved_id else f"tool_{uuid.uuid4()}"
+                display_name = (resolved_name or "").strip() or "tool_call"
+                yield sse.start_tool_block(tc_index, tool_id, display_name)
+                state = sse.blocks.tool_states[tc_index]
+                if state.pre_start_args:
+                    pre = state.pre_start_args
+                    state.pre_start_args = ""
+                    yield from self._emit_tool_arg_delta(sse, tc_index, pre)
+
+        state = sse.blocks.tool_states.get(tc_index)
+        if not arguments:
+            return
         if state is None or not state.started:
-            name = state.name if state else ""
-            if name or tc.get("id"):
-                tool_id = tc.get("id") or f"tool_{uuid.uuid4()}"
-                yield sse.start_tool_block(tc_index, tool_id, name)
-
-        args = fn_delta.get("arguments", "")
-        if args:
-            state = sse.blocks.tool_states.get(tc_index)
-            if state is None or not state.started:
-                tool_id = tc.get("id") or f"tool_{uuid.uuid4()}"
-                name = (state.name if state else None) or "tool_call"
-                yield sse.start_tool_block(tc_index, tool_id, name)
-                state = sse.blocks.tool_states.get(tc_index)
-
-            current_name = state.name if state else ""
-            if current_name == "Task":
-                parsed = sse.blocks.buffer_task_args(tc_index, args)
-                if parsed is not None:
-                    yield sse.emit_tool_delta(tc_index, json.dumps(parsed))
+            state = sse.blocks.ensure_tool_state(tc_index)
+            if not (resolved_name or "").strip():
+                state.pre_start_args += arguments
                 return
 
-            yield sse.emit_tool_delta(tc_index, args)
+        yield from self._emit_tool_arg_delta(sse, tc_index, arguments)
 
     def _flush_task_arg_buffers(self, sse: SSEBuilder) -> Iterator[str]:
         """Emit buffered Task args as a single JSON delta (best-effort)."""
@@ -152,11 +217,12 @@ class OpenAICompatibleProvider(BaseProvider):
         input_tokens: int = 0,
         *,
         request_id: str | None = None,
+        thinking_enabled: bool | None = None,
     ) -> AsyncIterator[str]:
         """Stream response in Anthropic SSE format."""
         with logger.contextualize(request_id=request_id):
             async for event in self._stream_response_impl(
-                request, input_tokens, request_id
+                request, input_tokens, request_id, thinking_enabled=thinking_enabled
             ):
                 yield event
 
@@ -165,13 +231,21 @@ class OpenAICompatibleProvider(BaseProvider):
         request: Any,
         input_tokens: int,
         request_id: str | None,
+        *,
+        thinking_enabled: bool | None,
     ) -> AsyncIterator[str]:
         """Shared streaming implementation."""
         tag = self._provider_name
         message_id = f"msg_{uuid.uuid4()}"
-        sse = SSEBuilder(message_id, request.model, input_tokens)
+        sse = SSEBuilder(
+            message_id,
+            request.model,
+            input_tokens,
+            log_raw_events=self._config.log_raw_sse_events,
+        )
 
-        body = self._build_request_body(request)
+        body = self._build_request_body(request, thinking_enabled=thinking_enabled)
+        thinking_enabled = self._is_thinking_enabled(request, thinking_enabled)
         req_tag = f" request_id={request_id}" if request_id else ""
         logger.info(
             "{}_STREAM:{} model={} msgs={} tools={}",
@@ -186,12 +260,8 @@ class OpenAICompatibleProvider(BaseProvider):
 
         think_parser = ThinkTagParser()
         heuristic_parser = HeuristicToolParser()
-        thinking_enabled = self._is_thinking_enabled(request)
-
         finish_reason = None
         usage_info = None
-        error_occurred = False
-        error_message = ""
 
         async with self._global_rate_limiter.concurrency_slot():
             try:
@@ -247,26 +317,10 @@ class OpenAICompatibleProvider(BaseProvider):
                                     yield sse.emit_text_delta(filtered_text)
 
                                 for tool_use in detected_tools:
-                                    for event in sse.close_content_blocks():
-                                        yield event
-
-                                    block_idx = sse.blocks.allocate_index()
-                                    if tool_use.get("name") == "Task" and isinstance(
-                                        tool_use.get("input"), dict
+                                    for event in _iter_heuristic_tool_use_sse(
+                                        sse, tool_use
                                     ):
-                                        tool_use["input"]["run_in_background"] = False
-                                    yield sse.content_block_start(
-                                        block_idx,
-                                        "tool_use",
-                                        id=tool_use["id"],
-                                        name=tool_use["name"],
-                                    )
-                                    yield sse.content_block_delta(
-                                        block_idx,
-                                        "input_json_delta",
-                                        json.dumps(tool_use["input"]),
-                                    )
-                                    yield sse.content_block_stop(block_idx)
+                                        yield event
 
                     # Handle native tool calls
                     if delta.tool_calls:
@@ -284,19 +338,16 @@ class OpenAICompatibleProvider(BaseProvider):
                             for event in self._process_tool_call(tc_info, sse):
                                 yield event
 
+            except asyncio.CancelledError, GeneratorExit:
+                raise
             except Exception as e:
-                logger.error("{}_ERROR:{} {}: {}", tag, req_tag, type(e).__name__, e)
-                mapped_e = map_error(e)
-                error_occurred = True
-                if getattr(mapped_e, "status_code", None) == 405:
-                    base_message = (
-                        f"Upstream provider {tag} rejected the request method "
-                        "or endpoint (HTTP 405)."
-                    )
-                else:
-                    base_message = get_user_facing_error_message(
-                        mapped_e, read_timeout_s=self._config.http_read_timeout
-                    )
+                self._log_stream_transport_error(tag, req_tag, e)
+                mapped_e = map_error(e, rate_limiter=self._global_rate_limiter)
+                base_message = user_visible_message_for_mapped_provider_error(
+                    mapped_e,
+                    provider_name=tag,
+                    read_timeout_s=self._config.http_read_timeout,
+                )
                 error_message = append_request_id(base_message, request_id)
                 logger.info(
                     "{}_STREAM: Emitting SSE error event for {}{}",
@@ -304,10 +355,18 @@ class OpenAICompatibleProvider(BaseProvider):
                     type(e).__name__,
                     req_tag,
                 )
-                for event in sse.close_content_blocks():
+                for event in sse.close_all_blocks():
                     yield event
-                for event in sse.emit_error(error_message):
-                    yield event
+                if sse.blocks.has_emitted_tool_block():
+                    # Avoid a second assistant text block after an emitted tool_use, which
+                    # breaks OpenAI history replay (issue #206) when Claude Code stores it.
+                    yield sse.emit_top_level_error(error_message)
+                else:
+                    for event in sse.emit_error(error_message):
+                        yield event
+                yield sse.message_delta("end_turn", 1)
+                yield sse.message_stop()
+                return
 
         # Flush remaining content
         remaining = think_parser.flush()
@@ -325,32 +384,27 @@ class OpenAICompatibleProvider(BaseProvider):
                 yield sse.emit_text_delta(remaining.content)
 
         for tool_use in heuristic_parser.flush():
-            for event in sse.close_content_blocks():
+            for event in _iter_heuristic_tool_use_sse(sse, tool_use):
                 yield event
 
-            block_idx = sse.blocks.allocate_index()
-            yield sse.content_block_start(
-                block_idx,
-                "tool_use",
-                id=tool_use["id"],
-                name=tool_use["name"],
-            )
-            if tool_use.get("name") == "Task" and isinstance(
-                tool_use.get("input"), dict
-            ):
-                tool_use["input"]["run_in_background"] = False
-            yield sse.content_block_delta(
-                block_idx,
-                "input_json_delta",
-                json.dumps(tool_use["input"]),
-            )
-            yield sse.content_block_stop(block_idx)
-
-        if (
-            not error_occurred
-            and sse.blocks.text_index == -1
-            and not sse.blocks.tool_states
+        has_started_tool = any(s.started for s in sse.blocks.tool_states.values())
+        has_content_blocks = (
+            sse.blocks.text_index != -1
+            or sse.blocks.thinking_index != -1
+            or has_started_tool
+        )
+        if not has_content_blocks:
+            for event in sse.ensure_text_block():
+                yield event
+            yield sse.emit_text_delta(" ")
+        elif (
+            not has_started_tool
+            and not sse.accumulated_text.strip()
+            and sse.accumulated_reasoning.strip()
         ):
+            # Some OpenAI-compatible models (e.g. NIM reasoning templates) stream only
+            # ``reasoning_content`` with no ``content``; emit a minimal text block so
+            # clients and smoke ``text_content()`` see a completed assistant message.
             for event in sse.ensure_text_block():
                 yield event
             yield sse.emit_text_delta(" ")
@@ -361,11 +415,15 @@ class OpenAICompatibleProvider(BaseProvider):
         for event in sse.close_all_blocks():
             yield event
 
-        output_tokens = (
-            usage_info.completion_tokens
-            if usage_info and hasattr(usage_info, "completion_tokens")
-            else sse.estimate_output_tokens()
+        completion = (
+            getattr(usage_info, "completion_tokens", None)
+            if usage_info is not None
+            else None
         )
+        if isinstance(completion, int):
+            output_tokens = completion
+        else:
+            output_tokens = sse.estimate_output_tokens()
         if usage_info and hasattr(usage_info, "prompt_tokens"):
             provider_input = usage_info.prompt_tokens
             if isinstance(provider_input, int):

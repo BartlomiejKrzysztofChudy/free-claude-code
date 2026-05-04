@@ -5,6 +5,8 @@ import openai
 import pytest
 from httpx import Request, Response
 
+from config.nim import NimSettings
+from providers.defaults import NVIDIA_NIM_DEFAULT_BASE
 from providers.nvidia_nim import NvidiaNimProvider
 
 
@@ -20,6 +22,12 @@ class MockTool:
         self.name = name
         self.description = description
         self.input_schema = input_schema
+
+
+class MockBlock:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
 
 class MockRequest:
@@ -42,7 +50,7 @@ class MockRequest:
 def _make_bad_request_error(message: str) -> openai.BadRequestError:
     response = Response(
         status_code=400,
-        request=Request("POST", "https://integrate.api.nvidia.com/v1/chat/completions"),
+        request=Request("POST", f"{NVIDIA_NIM_DEFAULT_BASE}/chat/completions"),
     )
     body = {"error": {"message": message, "type": "BadRequestError", "code": 400}}
     return openai.BadRequestError(message, response=response, body=body)
@@ -52,7 +60,7 @@ def _make_bad_request_error(message: str) -> openai.BadRequestError:
 def mock_rate_limiter():
     """Mock the global rate limiter to prevent waiting."""
     with patch("providers.openai_compat.GlobalRateLimiter") as mock:
-        instance = mock.get_instance.return_value
+        instance = mock.get_scoped_instance.return_value
         instance.wait_if_blocked = AsyncMock(return_value=False)
 
         # execute_with_retry should call through to the actual function
@@ -67,8 +75,6 @@ def mock_rate_limiter():
 async def test_init(provider_config):
     """Test provider initialization."""
     with patch("providers.openai_compat.AsyncOpenAI") as mock_openai:
-        from config.nim import NimSettings
-
         provider = NvidiaNimProvider(provider_config, nim_settings=NimSettings())
         assert provider._api_key == "test_key"
         assert provider._base_url == "https://test.api.nvidia.com/v1"
@@ -78,7 +84,6 @@ async def test_init(provider_config):
 @pytest.mark.asyncio
 async def test_init_uses_configurable_timeouts():
     """Test that provider passes configurable read/write/connect timeouts to client."""
-    from config.nim import NimSettings
     from providers.base import ProviderConfig
 
     config = ProviderConfig(
@@ -100,8 +105,6 @@ async def test_init_uses_configurable_timeouts():
 @pytest.mark.asyncio
 async def test_build_request_body(provider_config):
     """Test request body construction."""
-    from config.nim import NimSettings
-
     provider = NvidiaNimProvider(provider_config, nim_settings=NimSettings())
     req = MockRequest()
     body = provider._build_request_body(req)
@@ -124,8 +127,6 @@ async def test_build_request_body(provider_config):
 async def test_build_request_body_omits_reasoning_when_globally_disabled(
     provider_config,
 ):
-    from config.nim import NimSettings
-
     provider = NvidiaNimProvider(
         provider_config.model_copy(update={"enable_thinking": False}),
         nim_settings=NimSettings(),
@@ -142,8 +143,6 @@ async def test_build_request_body_omits_reasoning_when_globally_disabled(
 async def test_build_request_body_omits_reasoning_when_request_disables_thinking(
     provider_config,
 ):
-    from config.nim import NimSettings
-
     provider = NvidiaNimProvider(provider_config, nim_settings=NimSettings())
     req = MockRequest()
     req.thinking.enabled = False
@@ -152,6 +151,44 @@ async def test_build_request_body_omits_reasoning_when_request_disables_thinking
     extra = body.get("extra_body", {})
     assert "chat_template_kwargs" not in extra
     assert "reasoning_budget" not in extra
+
+
+def test_preflight_and_build_request_issue_206_post_tool_text(nim_provider):
+    """Regression: assistant message with tool_use then text plus tool results (GitHub #206)."""
+    tool_id = "toolu_issue_206"
+    req = MockRequest(
+        messages=[
+            MockMessage("user", "Use echo once."),
+            MockMessage(
+                "assistant",
+                [
+                    MockBlock(
+                        type="tool_use",
+                        id=tool_id,
+                        name="echo_smoke",
+                        input={"value": "FCC_206"},
+                    ),
+                    MockBlock(
+                        type="text",
+                        text="Commentary after the tool row.",
+                    ),
+                ],
+            ),
+            MockMessage(
+                "user",
+                [
+                    MockBlock(
+                        type="tool_result", tool_use_id=tool_id, content="FCC_206"
+                    ),
+                    MockBlock(type="text", text="What was echoed?"),
+                ],
+            ),
+        ],
+    )
+    nim_provider.preflight_stream(req, thinking_enabled=False)
+    body = nim_provider._build_request_body(req, thinking_enabled=False)
+    assert "messages" in body
+    assert any(m.get("role") == "tool" for m in body["messages"])
 
 
 @pytest.mark.asyncio
@@ -241,8 +278,6 @@ async def test_stream_response_thinking_reasoning_content(nim_provider):
 
 @pytest.mark.asyncio
 async def test_stream_response_suppresses_thinking_when_disabled(provider_config):
-    from config.nim import NimSettings
-
     provider = NvidiaNimProvider(
         provider_config.model_copy(update={"enable_thinking": False}),
         nim_settings=NimSettings(),
@@ -277,10 +312,14 @@ async def test_stream_response_suppresses_thinking_when_disabled(provider_config
     assert "Answer" in event_text
 
 
+def _make_bad_request_error(message: str) -> openai.BadRequestError:
+    response = Response(status_code=400, request=Request("POST", "http://test"))
+    body = {"error": {"message": message}}
+    return openai.BadRequestError(message, response=response, body=body)
+
+
 @pytest.mark.asyncio
 async def test_stream_response_retries_without_chat_template(provider_config):
-    from config.nim import NimSettings
-
     provider = NvidiaNimProvider(
         provider_config,
         nim_settings=NimSettings(chat_template="custom_template"),
@@ -338,8 +377,6 @@ async def test_stream_response_retries_without_chat_template(provider_config):
 
 @pytest.mark.asyncio
 async def test_stream_response_does_not_retry_unrelated_bad_request(provider_config):
-    from config.nim import NimSettings
-
     provider = NvidiaNimProvider(
         provider_config,
         nim_settings=NimSettings(chat_template="custom_template"),
@@ -355,7 +392,7 @@ async def test_stream_response_does_not_retry_unrelated_bad_request(provider_con
 
     assert mock_create.await_count == 1
     event_text = "".join(events)
-    assert "unrelated bad request" in event_text
+    assert "Invalid request sent to provider" in event_text
     assert "event: message_stop" in event_text
 
 
@@ -437,6 +474,57 @@ async def test_stream_response_retries_without_reasoning_budget(nim_provider):
 
 
 @pytest.mark.asyncio
+async def test_stream_response_retries_without_reasoning_content(nim_provider):
+    req = MockRequest(
+        system=None,
+        messages=[
+            MockMessage(
+                "assistant",
+                [
+                    MockBlock(type="thinking", thinking="Need the tool."),
+                    MockBlock(
+                        type="tool_use",
+                        id="toolu_reasoning",
+                        name="echo_smoke",
+                        input={"value": "FCC_TOOL"},
+                    ),
+                ],
+            )
+        ],
+    )
+
+    mock_chunk = MagicMock()
+    mock_chunk.choices = [
+        MagicMock(
+            delta=MagicMock(content="Recovered", reasoning_content=""),
+            finish_reason="stop",
+        )
+    ]
+    mock_chunk.usage = MagicMock(completion_tokens=5)
+
+    async def mock_stream():
+        yield mock_chunk
+
+    error = _make_bad_request_error("Unsupported field: reasoning_content")
+
+    with patch.object(
+        nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.side_effect = [error, mock_stream()]
+
+        events = [e async for e in nim_provider.stream_response(req)]
+
+    assert mock_create.await_count == 2
+    first_call = mock_create.await_args_list[0].kwargs
+    second_call = mock_create.await_args_list[1].kwargs
+    assert first_call["messages"][0]["reasoning_content"] == "Need the tool."
+    assert "reasoning_content" not in second_call["messages"][0]
+    assert second_call["messages"][0]["tool_calls"][0]["id"] == "toolu_reasoning"
+    assert any("Recovered" in event for event in events)
+    assert any("message_stop" in event for event in events)
+
+
+@pytest.mark.asyncio
 async def test_stream_response_bad_request_without_reasoning_budget_does_not_retry(
     nim_provider,
 ):
@@ -451,5 +539,5 @@ async def test_stream_response_bad_request_without_reasoning_budget_does_not_ret
         events = [e async for e in nim_provider.stream_response(req)]
 
     assert mock_create.await_count == 1
-    assert any("Unsupported field: top_k" in event for event in events)
+    assert any("Invalid request sent to provider" in event for event in events)
     assert any("message_stop" in event for event in events)
